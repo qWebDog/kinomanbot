@@ -23,7 +23,7 @@ BOT_TOKEN = "8764495369:AAGuaieVwmsHzVloDRZDgv2nP6oDijAYTC4"
 TMDB_API_KEY = "eyJhbGciOiJIUzI1NiJ9.eyJhdWQiOiI5NTEwYjJlODAxYmFlMTcxNzFmNzM2NWU4ZGIyOTJiMSIsIm5iZiI6MTc4MTA4NzkzOS40NTIsInN1YiI6IjZhMjkzZWMzYTAwOTBhNDQ4Y2Q0ZTUwZCIsInNjb3BlcyI6WyJhcGlfcmVhZCJdLCJ2ZXJzaW9uIjoxfQ.myFjB6izWez3gXOA-8ErMPX2AH6SGKjPMFbUT7RcZrY"
 TMDB_BASE_URL = "https://api.themoviedb.org/3"
 
-# ⚠️ ЗАМЕНИТЕ ЭТОТ ID НА ВАШ РЕАЛЬНЫЙ TELEGRAM ID (узнайте у @userinfobot)
+# ⚠️ ЗАМЕНИТЕ ЭТОТ ID НА ВАШ РЕАЛЬНЫЙ TELEGRAM ID
 ADMIN_ID = 123456789  
 
 CHECK_INTERVAL = 7200
@@ -43,30 +43,15 @@ async def init_db():
     await db.execute("PRAGMA journal_mode=WAL;")
     await db.execute("PRAGMA synchronous=NORMAL;")
     
-    await db.execute("""
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )
-    """)
+    await db.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
     await db.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('donate_enabled', '0')")
     
-    await db.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            total_stars INTEGER DEFAULT 0
-        )
-    """)
+    await db.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, total_stars INTEGER DEFAULT 0)")
     
     await db.execute("""
         CREATE TABLE IF NOT EXISTS subscriptions (
-            user_id INTEGER,
-            tmdb_id INTEGER,
-            title TEXT,
-            imdb_id TEXT,
-            last_season INTEGER DEFAULT 1,
-            last_episode INTEGER DEFAULT 0,
-            last_checked REAL DEFAULT 0,
+            user_id INTEGER, tmdb_id INTEGER, title TEXT, imdb_id TEXT,
+            last_season INTEGER DEFAULT 1, last_episode INTEGER DEFAULT 0, last_checked REAL DEFAULT 0,
             PRIMARY KEY (user_id, tmdb_id)
         )
     """)
@@ -118,25 +103,13 @@ async def update_sub(user_id: int, tmdb_id: int, season: int, episode: int, chec
     await db.commit()
 
 # ==========================================
-# --- API, КЭШ И ПЕРЕВОД ---
+# --- API И КЭШ ---
 # ==========================================
 _cache: Dict[str, Tuple[float, dict]] = {}
 
-async def translate_to_en(text: str) -> str:
-    """Автоматический перевод русского названия на английский для улучшения поиска"""
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get("https://api.mymemory.translated.net/get", params={"q": text, "langpair": "ru|en"})
-            resp.raise_for_status()
-            json_data = resp.json()
-            translated = json_data.get("responseData", {}).get("translatedText", text)
-            return translated
-    except Exception:
-        return text # Если перевод не удался, возвращаем оригинал
-
 async def tmdb_request(endpoint: str, params: dict = None) -> Optional[dict]:
     params = params or {}
-    params["language"] = "ru-RU" # ВСЕГДА получаем результаты на русском
+    params["language"] = "ru-RU"
     cache_key = f"{endpoint}?{params}"
     now = time.time()
     
@@ -168,6 +141,11 @@ async def tmdb_request(endpoint: str, params: dict = None) -> Optional[dict]:
                 if attempt < 2:
                     await asyncio.sleep(2 ** attempt)
     return None
+
+def get_title_with_fallback(item: dict) -> str:
+    """Гарантированно возвращает название: русское, если есть, иначе оригинальное"""
+    title = item.get('name') or item.get('original_name') or item.get('title') or item.get('original_title') or 'Неизвестно'
+    return title.strip()
 
 # ==========================================
 # --- AIОGRAM SETUP & MIDDLEWARE ---
@@ -227,8 +205,10 @@ def cancel_donate_kb():
 def search_kb(results):
     kb = InlineKeyboardMarkup(inline_keyboard=[])
     for r in results[:5]:
+        title = get_title_with_fallback(r)
+        year = r.get('first_air_date', '')[:4] if r.get('first_air_date') else 'N/A'
         kb.inline_keyboard.append([InlineKeyboardButton(
-            text=f"🎬 {r.get('name', 'N/A')} ({r.get('first_air_date', '')[:4]})",
+            text=f"🎬 {title} ({year})",
             callback_data=f"select_{r['id']}"
         )])
     kb.inline_keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")])
@@ -244,14 +224,15 @@ def subs_kb(shows):
     return kb
 
 # ==========================================
-# --- ОБРАБОТЧИКИ ---
+# --- ОБРАБОТЧИКИ (С ОЧИСТКОЙ МУСОРА) ---
 # ==========================================
 @router.message(CommandStart())
 async def cmd_start(message: Message):
     await register_user(message.from_user.id)
     await message.answer(
         "👋 Привет! Я отслеживаю выход новых серий.\n"
-        "Всё меню работает на кнопках и не спамит чат.",
+        "💡 Поиск работает на русском и английском.\n"
+        "Все действия обновляют это сообщение, не засоряя чат.",
         reply_markup=await main_kb()
     )
 
@@ -264,8 +245,7 @@ async def go_main(callback: CallbackQuery):
 async def cmd_add(callback: CallbackQuery, state: FSMContext):
     await register_user(callback.from_user.id)
     await callback.message.edit_text(
-        "🔍 Введите название сериала:\n"
-        "*(Можно писать как на русском, так и на английском)*", 
+        "🔍 Введите название сериала (на русском или английском):",
         reply_markup=cancel_kb()
     )
     await state.set_state(AddShowStates.waiting_for_title)
@@ -280,45 +260,74 @@ async def cmd_cancel(callback: CallbackQuery, state: FSMContext):
 @router.message(AddShowStates.waiting_for_title)
 async def search_show(message: Message, state: FSMContext):
     await state.clear()
-    temp = await message.answer("🔎 Ищу в базе...")
+    query = message.text.strip()
     
-    # 1. Пробуем поискать по оригинальному запросу
-    data = await tmdb_request("/search/tv", {"query": message.text})
-    
-    # 2. Если ничего не найдено, пробуем перевести запрос на английский и ищем снова
-    if not data or not data.get("results"):
-        logging.info(f"Прямой поиск не дал результатов для '{message.text}'. Пробую перевод...")
-        await temp.edit_text("🔎 По русскому названию не найдено. Пробую перевести и найти на английском...")
-        
-        en_query = await translate_to_en(message.text)
-        if en_query and en_query.lower() != message.text.lower():
-            logging.info(f"Переведенный запрос: '{en_query}'")
-            data = await tmdb_request("/search/tv", {"query": en_query})
-    
-    if not data or not data.get("results"):
-        await temp.edit_text("❌ Ничего не найдено. Попробуйте написать название на английском или уточнить запрос.", reply_markup=await main_kb())
+    # 🧹 ОЧИСТКА ЧАТА: Удаляем сообщение пользователя, чтобы не было мусора
+    try:
+        await message.delete()
+    except Exception:
+        pass # Если бот не админ, сообщение останется, но спама от бота не будет
+
+    if not query:
+        await message.answer("❌ Введите название сериала.", reply_markup=await main_kb())
         return
-        
-    await temp.edit_text(f"📺 Найдено для '{message.text}'. Выберите:", reply_markup=search_kb(data["results"]))
+    
+    # Отправляем временное сообщение, которое будем редактировать
+    temp_msg = await message.answer("🔎 Ищу в базе...")
+    
+    data = await tmdb_request("/search/tv", {"query": query, "include_adult": "false"})
+    
+    if not data or not data.get("results"):
+        await temp_msg.edit_text(
+            f"❌ Сериалы по запросу '{query}' не найдены.\n\n"
+            "💡 Попробуйте ввести оригинальное название на английском языке.",
+            reply_markup=await main_kb()
+        )
+        return
+    
+    results = data["results"]
+    await temp_msg.edit_text(
+        f"📺 Найдено совпадений: {len(results)}\n"
+        f"🔍 По запросу: '{query}'\n\n"
+        "Выберите сериал из списка:",
+        reply_markup=search_kb(results)
+    )
 
 @router.callback_query(F.data.startswith("select_"))
 async def select_show(callback: CallbackQuery):
     tmdb_id = int(callback.data.split("_")[1])
     await callback.answer("⏳ Загружаю данные...")
+    
     info = await tmdb_request(f"/tv/{tmdb_id}")
     if not info:
         await callback.message.edit_text("⚠️ Не удалось загрузить данные.", reply_markup=await main_kb())
         return
-    await add_sub(callback.from_user.id, tmdb_id, info["name"], info.get("external_ids", {}).get("imdb_id", "N/A"))
-    await callback.message.edit_text(f"✅ **{info['name']}** добавлен в отслеживание!", reply_markup=await main_kb())
+    
+    title = get_title_with_fallback(info)
+    imdb_id = info.get('external_ids', {}).get('imdb_id', 'N/A')
+    
+    await add_sub(callback.from_user.id, tmdb_id, title, imdb_id)
+    await callback.message.edit_text(
+        f"✅ **{title}** успешно добавлен в отслеживание!\n\n"
+        f"🔔 Вы получите уведомление, когда выйдет новая серия.",
+        reply_markup=await main_kb()
+    )
 
 @router.callback_query(F.data == "my_shows")
 async def cmd_my(callback: CallbackQuery):
     shows = await get_subs(callback.from_user.id)
     if not shows:
-        await callback.message.edit_text("📭 Пока нет отслеживаемых сериалов.", reply_markup=await main_kb())
+        await callback.message.edit_text(
+            "📭 Пока нет отслеживаемых сериалов.\n"
+            "Нажмите '➕ Добавить сериал', чтобы начать!",
+            reply_markup=await main_kb()
+        )
     else:
-        await callback.message.edit_text("📺 Ваши подписки:", reply_markup=subs_kb(shows))
+        await callback.message.edit_text(
+            f"📺 Ваши подписки ({len(shows)}):\n\n"
+            "Нажмите на сериал, чтобы удалить его:",
+            reply_markup=subs_kb(shows)
+        )
     await callback.answer()
 
 @router.callback_query(F.data.startswith("del_"))
@@ -327,15 +336,21 @@ async def cmd_del(callback: CallbackQuery):
     await remove_sub(callback.from_user.id, tmdb_id)
     shows = await get_subs(callback.from_user.id)
     if not shows:
-        await callback.message.edit_text("📭 Пока нет отслеживаемых сериалов.", reply_markup=await main_kb())
+        await callback.message.edit_text(
+            "📭 Пока нет отслеживаемых сериалов.",
+            reply_markup=await main_kb()
+        )
     else:
-        await callback.message.edit_text("📺 Ваши подписки:", reply_markup=subs_kb(shows))
+        await callback.message.edit_text(
+            f"📺 Ваши подписки ({len(shows)}):",
+            reply_markup=subs_kb(shows)
+        )
     await callback.answer("🗑 Удалено")
 
 @router.callback_query(F.data == "force_check")
 async def cmd_force(callback: CallbackQuery):
     await callback.answer("🔄 Проверка запущена...")
-    await callback.message.edit_text("✅ Запрос отправлен.", reply_markup=await main_kb())
+    await callback.message.edit_text("✅ Запрос на проверку новых серий отправлен.", reply_markup=await main_kb())
     asyncio.create_task(check_new_episodes(force=True))
 
 # ==========================================
@@ -399,7 +414,7 @@ async def cb_toggle_donate(callback: CallbackQuery):
         f"👥 Всего пользователей: `{stats['total_users']}`\n"
         f"📺 Активных подписчиков: `{stats['active_subscribers']}`\n"
         f"⭐️ Всего собрано звезд: `{stats['total_stars']}`\n\n"
-        f"💎 Статус кнопки 'Поддержать проект': {status_text}\n\n"
+        f"💎 Статус кнопки: {status_text}\n\n"
         f"✅ Настройка успешно сохранена!"
     )
     
@@ -463,16 +478,21 @@ async def cmd_cancel_donate(callback: CallbackQuery, state: FSMContext):
 async def process_custom_amount(message: Message, state: FSMContext):
     await state.clear()
     user_input = message.text.strip()
+    
+    # 🧹 ОЧИСТКА ЧАТА: Удаляем сообщение пользователя с суммой
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
     try:
         amount = int(user_input)
     except ValueError:
-        await message.answer("❌ Пожалуйста, введите целое число.")
-        await message.answer("✏️ Введите сумму (мин. 10 ⭐️):", reply_markup=cancel_donate_kb())
+        await message.answer("❌ Пожалуйста, введите целое число.", reply_markup=await main_kb())
         return
 
     if amount < 10:
-        await message.answer("❌ Минимальная сумма доната: 10 звезд ⭐️")
-        await message.answer("✏️ Введите сумму (мин. 10 ⭐️):", reply_markup=cancel_donate_kb())
+        await message.answer("❌ Минимальная сумма доната: 10 звезд ⭐️", reply_markup=await main_kb())
         return
 
     await message.answer_invoice(
@@ -530,7 +550,12 @@ async def check_new_episodes(force: bool = False):
         current_episodes = len(season_data.get("episodes", []))
         if current_seasons > last_s or current_episodes > last_e:
             try:
-                await bot.send_message(user_id, f"🎉 Вышла новая серия!\n📺 **{title}**\n🔹 Сезон {current_seasons}, Серия {current_episodes}")
+                await bot.send_message(
+                    user_id, 
+                    f"🎉 Вышла новая серия!\n"
+                    f"📺 **{title}**\n"
+                    f"🔹 Сезон {current_seasons}, Серия {current_episodes}"
+                )
                 logging.info(f"Новая серия {title} для {user_id}")
             except Exception as e:
                 logging.error(f"Ошибка отправки {user_id}: {e}")
@@ -543,7 +568,7 @@ async def check_new_episodes(force: bool = False):
 async def main():
     await init_db()
     asyncio.create_task(check_new_episodes())
-    logging.info(f"🤖 Бот запущен! Admin ID настроен на: {ADMIN_ID}")
+    logging.info(f"🤖 Бот запущен! Admin ID: {ADMIN_ID}")
     try:
         await dp.start_polling(bot)
     finally:
