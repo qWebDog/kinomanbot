@@ -36,6 +36,102 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 logger = logging.getLogger(__name__)
 
 # ==========================================
+# --- СЛОВАРЬ ПОПУЛЯРНЫХ СЕРИАЛОВ (RU → EN) ---
+# ==========================================
+POPULAR_SHOWS_RU_EN = {
+    "во все тяжкие": "Breaking Bad",
+    "шерлок": "Sherlock",
+    "игра престолов": "Game of Thrones",
+    "ходячие мертвецы": "The Walking Dead",
+    "друзья": "Friends",
+    "офис": "The Office",
+    "сверхъестественное": "Supernatural",
+    "теория большого взрыва": "The Big Bang Theory",
+    "как я встретил вашу маму": "How I Met Your Mother",
+    "клиника": "Scrubs",
+    "побег": "Prison Break",
+    "остаться в живых": "Lost",
+    "дэкстер": "Dexter",
+    "настоящий детектив": "True Detective",
+    "черное зеркало": "Black Mirror",
+    "карточный домик": "House of Cards",
+    " Breaking bad": "Breaking Bad",
+    "vikings": "Vikings",
+    "викинги": "Vikings",
+    "игра в кальмара": "Squid Game",
+    "ведьмак": "The Witcher",
+    "очень странные дела": "Stranger Things",
+    "корона": "The Crown",
+    "мандалорец": "The Mandalorian",
+    "пацаны": "The Boys",
+    "родина": "Homeland",
+    "карточный домик": "House of Cards",
+    "лучше звоните соллу": "Better Call Saul",
+    "фарго": "Fargo",
+    "мир дикого запада": "Westworld",
+    "рассказ служанки": "The Handmaid's Tale",
+    "тьма": "Dark",
+    "бумажный дом": "Money Heist",
+    "ла-каса де папел": "Money Heist",
+    "король лев": "The Lion Guard",
+    "анатомия страсти": "Grey's Anatomy",
+    "скорая помощь": "ER",
+    "доктор хаус": "House M.D.",
+    "csi": "CSI",
+    "мыслить как преступник": "Criminal Minds",
+    "красавцы": "Entourage",
+    "секс в большом городе": "Sex and the City",
+    "отчаянные домохозяйки": "Desperate Housewives",
+    "дефективные": "Misfits",
+    "любовь и другие лекарства": "Love and Other Drugs",
+    "бесстыжие": "Shameless",
+    "подпольная империя": "Boardwalk Empire",
+    "подземка": "Underground",
+    "американская история ужасов": "American Horror Story",
+    "родина": "Homeland",
+    "викинги": "Vikings",
+    "последнее королевство": "The Last Kingdom",
+    "королевство": "Kingdom",
+    "тюддоры": "The Tudors",
+    "рим": "Rome",
+    "спартак": "Spartacus",
+    "вика": "Vika",
+}
+
+def translate_ru_to_en(query: str) -> str:
+    """Пытается перевести русское название в английское"""
+    query_lower = query.lower().strip()
+    
+    # Прямое совпадение
+    if query_lower in POPULAR_SHOWS_RU_EN:
+        return POPULAR_SHOWS_RU_EN[query_lower]
+    
+    # Частичное совпадение (если запрос содержит русское название)
+    for ru_name, en_name in POPULAR_SHOWS_RU_EN.items():
+        if ru_name in query_lower:
+            # Если есть год, добавляем его
+            import re
+            year_match = re.search(r'\b(19|20)\d{2}\b', query)
+            if year_match:
+                return f"{en_name} {year_match.group()}"
+            return en_name
+    
+    return query  # Возвращаем оригинал, если не нашли перевод
+
+# ==========================================
+# --- УТИЛИТЫ ---
+# ==========================================
+async def safe_edit_message(message, text: str, reply_markup=None, parse_mode=None):
+    """Безопасное редактирование: игнорирует ошибку 'message is not modified'"""
+    try:
+        await message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+    except Exception as e:
+        if "message is not modified" in str(e).lower():
+            logger.debug("Message not modified - ignored")
+        else:
+            raise e
+
+# ==========================================
 # --- БАЗА ДАННЫХ ---
 # ==========================================
 db: Optional[aiosqlite.Connection] = None
@@ -139,7 +235,6 @@ async def tmdb_request(endpoint: str, params: dict = None) -> Optional[dict]:
             return None
 
 async def omdb_search(query: str) -> list:
-    """Поиск через OMDb API"""
     if not OMDB_API_KEY:
         logger.warning("OMDb API ключ не настроен")
         return []
@@ -152,11 +247,7 @@ async def omdb_search(query: str) -> list:
             return data
     
     try:
-        params = {
-            "apikey": OMDB_API_KEY,
-            "s": query,
-            "type": "series"
-        }
+        params = {"apikey": OMDB_API_KEY, "s": query, "type": "series"}
         async with httpx.AsyncClient(timeout=15.0) as client:
             logger.info(f"OMDb Request: {OMDB_BASE_URL} | Query: {query}")
             resp = await client.get(OMDB_BASE_URL, params=params)
@@ -192,7 +283,6 @@ async def omdb_search(query: str) -> list:
         return []
 
 async def omdb_get_details(imdb_id: str) -> Optional[dict]:
-    """Получение деталей сериала по IMDb ID через OMDb"""
     if not OMDB_API_KEY:
         return None
     
@@ -204,11 +294,7 @@ async def omdb_get_details(imdb_id: str) -> Optional[dict]:
             return data
     
     try:
-        params = {
-            "apikey": OMDB_API_KEY,
-            "i": imdb_id,
-            "plot": "short"
-        }
+        params = {"apikey": OMDB_API_KEY, "i": imdb_id, "plot": "short"}
         async with httpx.AsyncClient(timeout=15.0) as client:
             resp = await client.get(OMDB_BASE_URL, params=params)
             resp.raise_for_status()
@@ -236,7 +322,17 @@ async def hybrid_search(query: str) -> list:
         logger.info(f"TMDB (EN): {len(data_en['results'])} результатов")
         return data_en["results"]
     
-    # 3. OMDb (запасной вариант)
+    # 3. Переводим русское название в английское
+    translated_query = translate_ru_to_en(query)
+    if translated_query != query:
+        logger.info(f"Перевод: '{query}' → '{translated_query}'")
+        
+        # Пробуем OMDb с английским названием
+        omdb_results = await omdb_search(translated_query)
+        if omdb_results and not (len(omdb_results) == 1 and omdb_results[0].get("error")):
+            return omdb_results
+    
+    # 4. OMDb с оригинальным запросом
     logger.info("TMDB недоступен, пробуем OMDb...")
     omdb_results = await omdb_search(query)
     if omdb_results:
@@ -335,7 +431,7 @@ async def cmd_start(message: Message):
     await register_user(message.from_user.id)
     await message.answer(
         "👋 Привет! Я отслеживаю выход новых серий.\n"
-        "💡 Поиск: TMDB → OMDb\n"
+        "💡 Поиск: TMDB → OMDb (с автопереводом RU→EN)\n"
         "Все действия обновляют одно сообщение.",
         reply_markup=await main_kb()
     )
@@ -353,7 +449,7 @@ async def cmd_test_search(message: Message):
     results = await hybrid_search(query)
     
     if results and len(results) == 1 and results[0].get("error") == "too_many_results":
-        await loading_msg.edit_text(
+        await safe_edit_message(loading_msg,
             f"⚠️ OMDb вернул 'Too many results' для '{query}'.\n\n"
             "Попробуйте уточнить запрос:\n"
             "• Добавить год\n"
@@ -362,20 +458,20 @@ async def cmd_test_search(message: Message):
         return
     
     if not results:
-        await loading_msg.edit_text(f"❌ Ничего не найдено для '{query}'.\nПроверьте логи.")
+        await safe_edit_message(loading_msg, f"❌ Ничего не найдено для '{query}'.\nПроверьте логи.")
     else:
         titles = [get_title_with_fallback(r) for r in results]
-        await loading_msg.edit_text(f"✅ Найдено {len(results)}:\n\n" + "\n".join(f"• {t}" for t in titles))
+        await safe_edit_message(loading_msg, f"✅ Найдено {len(results)}:\n\n" + "\n".join(f"• {t}" for t in titles))
 
 @router.callback_query(F.data == "main_menu")
 async def go_main(callback: CallbackQuery):
-    await callback.message.edit_text("📺 Главное меню:", reply_markup=await main_kb())
+    await safe_edit_message(callback.message, "📺 Главное меню:", reply_markup=await main_kb())
     await callback.answer()
 
 @router.callback_query(F.data == "add_show")
 async def cmd_add(callback: CallbackQuery, state: FSMContext):
     await register_user(callback.from_user.id)
-    await callback.message.edit_text(
+    await safe_edit_message(callback.message,
         "🔍 Введите название сериала (RU/EN):",
         reply_markup=cancel_kb()
     )
@@ -385,7 +481,7 @@ async def cmd_add(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "cancel")
 async def cmd_cancel(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    await callback.message.edit_text("Действие отменено.", reply_markup=await main_kb())
+    await safe_edit_message(callback.message, "Действие отменено.", reply_markup=await main_kb())
     await callback.answer()
 
 @router.message(AddShowStates.waiting_for_title)
@@ -399,29 +495,29 @@ async def search_show(message: Message, state: FSMContext):
         pass
 
     if not query:
-        await loading_msg.edit_text("❌ Введите название.", reply_markup=await main_kb())
+        await safe_edit_message(loading_msg, "❌ Введите название.", reply_markup=await main_kb())
         return
     
     results = await hybrid_search(query)
     
     if results and len(results) == 1 and results[0].get("error") == "too_many_results":
-        await loading_msg.edit_text(
+        await safe_edit_message(loading_msg,
             f"⚠️ По запросу '{query}' найдено слишком много результатов.\n\n"
             "💡 Попробуйте:\n"
-            "• Добавить год (например: 'Breaking Bad 2008')\n"
+            "• Добавить год (например: 'Sherlock 2010')\n"
             "• Использовать оригинальное название на английском",
             reply_markup=await main_kb()
         )
         return
     
     if not results:
-        await loading_msg.edit_text(
+        await safe_edit_message(loading_msg,
             f"❌ По запросу '{query}' ничего не найдено.\n\n"
             "💡 Попробуйте оригинальное название на английском.",
             reply_markup=await main_kb()
         )
     else:
-        await loading_msg.edit_text(
+        await safe_edit_message(loading_msg,
             f"📺 Найдено: {len(results)}\n🔍 Запрос: '{query}'\n\nВыберите сериал:",
             reply_markup=search_kb(results)
         )
@@ -431,33 +527,31 @@ async def select_show(callback: CallbackQuery):
     item_id = callback.data.split("_", 1)[1]
     await callback.answer("⏳ Загружаю...")
     
-    # OMDb результат
     if item_id.startswith("omdb_"):
         imdb_id = item_id.replace("omdb_", "")
         details = await omdb_get_details(imdb_id)
         if details:
             title = details.get("Title", "Неизвестно")
             await add_sub(callback.from_user.id, 0, title, imdb_id)
-            await callback.message.edit_text(
+            await safe_edit_message(callback.message,
                 f"✅ **{title}** добавлен!\n\n🔔 Уведомления будут приходить при выходе новых серий.",
                 reply_markup=await main_kb()
             )
         else:
-            await callback.message.edit_text("⚠️ Не удалось загрузить данные.", reply_markup=await main_kb())
+            await safe_edit_message(callback.message, "⚠️ Не удалось загрузить данные.", reply_markup=await main_kb())
         return
 
-    # TMDB результат
     tmdb_id = int(item_id)
     info = await tmdb_request(f"/tv/{tmdb_id}")
     if not info:
-        await callback.message.edit_text("⚠️ Не удалось загрузить данные.", reply_markup=await main_kb())
+        await safe_edit_message(callback.message, "⚠️ Не удалось загрузить данные.", reply_markup=await main_kb())
         return
     
     title = get_title_with_fallback(info)
     imdb_id = info.get('external_ids', {}).get('imdb_id', 'N/A')
     
     await add_sub(callback.from_user.id, tmdb_id, title, imdb_id)
-    await callback.message.edit_text(
+    await safe_edit_message(callback.message,
         f"✅ **{title}** добавлен!\n\n🔔 Уведомления будут приходить при выходе новых серий.",
         reply_markup=await main_kb()
     )
@@ -466,12 +560,12 @@ async def select_show(callback: CallbackQuery):
 async def cmd_my(callback: CallbackQuery):
     shows = await get_subs(callback.from_user.id)
     if not shows:
-        await callback.message.edit_text(
+        await safe_edit_message(callback.message,
             "📭 Пока нет сериалов.\nНажмите '➕ Добавить сериал'.",
             reply_markup=await main_kb()
         )
     else:
-        await callback.message.edit_text(
+        await safe_edit_message(callback.message,
             f"📺 Ваши подписки ({len(shows)}):",
             reply_markup=subs_kb(shows)
         )
@@ -483,15 +577,15 @@ async def cmd_del(callback: CallbackQuery):
     await remove_sub(callback.from_user.id, tmdb_id)
     shows = await get_subs(callback.from_user.id)
     if not shows:
-        await callback.message.edit_text("📭 Пока нет сериалов.", reply_markup=await main_kb())
+        await safe_edit_message(callback.message, "📭 Пока нет сериалов.", reply_markup=await main_kb())
     else:
-        await callback.message.edit_text(f"📺 Ваши подписки ({len(shows)}):", reply_markup=subs_kb(shows))
+        await safe_edit_message(callback.message, f"📺 Ваши подписки ({len(shows)}):", reply_markup=subs_kb(shows))
     await callback.answer("🗑 Удалено")
 
 @router.callback_query(F.data == "force_check")
 async def cmd_force(callback: CallbackQuery):
     await callback.answer("🔄 Проверка запущена...")
-    await callback.message.edit_text("✅ Запрос отправлен.", reply_markup=await main_kb())
+    await safe_edit_message(callback.message, "✅ Запрос отправлен.", reply_markup=await main_kb())
     asyncio.create_task(check_new_episodes(force=True))
 
 # ==========================================
@@ -530,7 +624,7 @@ async def show_admin_menu(target: Message | CallbackQuery):
     if isinstance(target, Message):
         await target.answer(text, reply_markup=kb, parse_mode="Markdown")
     else:
-        await target.message.edit_text(text, reply_markup=kb, parse_mode="Markdown")
+        await safe_edit_message(target.message, text, reply_markup=kb, parse_mode="Markdown")
         await target.answer()
 
 @router.callback_query(F.data == "toggle_donate")
@@ -554,7 +648,7 @@ async def cb_toggle_donate(callback: CallbackQuery):
         [InlineKeyboardButton(text="🔙 Меню", callback_data="main_menu")]
     ])
     
-    await callback.message.edit_text(text, reply_markup=kb, parse_mode="Markdown")
+    await safe_edit_message(callback.message, text, reply_markup=kb, parse_mode="Markdown")
     await callback.answer(f"Донаты: {status_text}")
 
 # ==========================================
@@ -562,7 +656,7 @@ async def cb_toggle_donate(callback: CallbackQuery):
 # ==========================================
 @router.callback_query(F.data == "donate_menu")
 async def cmd_donate_menu(callback: CallbackQuery):
-    await callback.message.edit_text(
+    await safe_edit_message(callback.message,
         "💎 **Поддержка проекта**\n\nВыберите сумму:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="10 ⭐️", callback_data="donate_10"), InlineKeyboardButton(text="50 ⭐️", callback_data="donate_50")],
@@ -589,7 +683,7 @@ async def process_fixed_donation(callback: CallbackQuery):
 
 @router.callback_query(F.data == "donate_custom")
 async def cmd_donate_custom(callback: CallbackQuery, state: FSMContext):
-    await callback.message.edit_text(
+    await safe_edit_message(callback.message,
         "✏️ Введите сумму (мин. 10 ⭐️):",
         reply_markup=cancel_donate_kb()
     )
@@ -599,7 +693,7 @@ async def cmd_donate_custom(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "cancel_donate")
 async def cmd_cancel_donate(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    await callback.message.edit_text("Отменено.", reply_markup=await main_kb())
+    await safe_edit_message(callback.message, "Отменено.", reply_markup=await main_kb())
     await callback.answer()
 
 @router.message(DonateStates.waiting_for_amount)
@@ -614,14 +708,14 @@ async def process_custom_amount(message: Message, state: FSMContext):
     try:
         amount = int(message.text.strip())
     except ValueError:
-        await response_msg.edit_text("❌ Введите число.", reply_markup=await main_kb())
+        await safe_edit_message(response_msg, "❌ Введите число.", reply_markup=await main_kb())
         return
 
     if amount < 10:
-        await response_msg.edit_text("❌ Минимум: 10 ⭐️", reply_markup=await main_kb())
+        await safe_edit_message(response_msg, "❌ Минимум: 10 ⭐️", reply_markup=await main_kb())
         return
 
-    await response_msg.edit_text("Формирую счет...", reply_markup=await main_kb())
+    await safe_edit_message(response_msg, "Формирую счет...", reply_markup=await main_kb())
     await response_msg.answer_invoice(
         title=f"💎 Поддержка ({amount} ⭐️)",
         description=f"Сумма: {amount} Stars.",
@@ -661,7 +755,6 @@ async def check_new_episodes(force: bool = False):
         current_seasons = last_s
         current_episodes = last_e
         
-        # Если есть TMDB ID, используем TMDB
         if tmdb_id > 0:
             info = await tmdb_request(f"/tv/{tmdb_id}")
             if info:
@@ -672,7 +765,6 @@ async def check_new_episodes(force: bool = False):
                 season_data = await tmdb_request(f"/tv/{tmdb_id}/season/{current_seasons}")
                 if season_data:
                     current_episodes = len(season_data.get("episodes", []))
-        # Если есть IMDb ID, используем OMDb
         elif imdb_id and imdb_id != 'N/A':
             details = await omdb_get_details(imdb_id)
             if details:
