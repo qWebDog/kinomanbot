@@ -26,13 +26,15 @@ TMDB_API_KEY = "eyJhbGciOiJIUzI1NiJ9.eyJhdWQiOiI5NTEwYjJlODAxYmFlMTcxNzFmNzM2NWU
 TMDB_BASE_URL = "https://api.themoviedb.org/3"
 
 # ⚠️ ЗАМЕНИТЕ НА ВАШ РЕАЛЬНЫЙ ID
-ADMIN_ID = 123456789  
+ADMIN_ID = 673594120 
 
 CHECK_INTERVAL = 7200
 CACHE_TTL = 3600
 MIN_CHECK_INTERVAL = 86400
 
+# Настраиваем логирование для максимальной информативности
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+logger = logging.getLogger(__name__)
 
 # ==========================================
 # --- БАЗА ДАННЫХ ---
@@ -105,13 +107,12 @@ async def update_sub(user_id: int, tmdb_id: int, season: int, episode: int, chec
     await db.commit()
 
 # ==========================================
-# --- API И ГИБРИДНЫЙ ПОИСК (TMDB + MyShows) ---
+# --- API И ПОИСК (С ДЕТАЛЬНЫМ ЛОГИРОВАНИЕМ) ---
 # ==========================================
 _cache: Dict[str, Tuple[float, dict]] = {}
 
 async def tmdb_request(endpoint: str, params: dict = None) -> Optional[dict]:
     params = params or {}
-    params["language"] = "ru-RU"
     cache_key = f"{endpoint}?{params}"
     now = time.time()
     
@@ -120,37 +121,43 @@ async def tmdb_request(endpoint: str, params: dict = None) -> Optional[dict]:
         if now - ts < CACHE_TTL:
             return data
 
-    headers = {}
+    headers = {"accept": "application/json"}
+    # Ваш ключ - это JWT v4, используем Bearer авторизацию
     if TMDB_API_KEY.startswith("eyJ"):
         headers["Authorization"] = f"Bearer {TMDB_API_KEY}"
     else:
         params["api_key"] = TMDB_API_KEY
 
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        for attempt in range(3):
-            try:
-                resp = await client.get(f"{TMDB_BASE_URL}{endpoint}", params=params, headers=headers)
-                resp.raise_for_status()
-                data = resp.json()
-                _cache[cache_key] = (now, data)
-                return data
-            except httpx.HTTPStatusError as e:
-                if e.response.status_code == 429:
-                    await asyncio.sleep(5)
-                    continue
-                break
-            except Exception as e:
-                if attempt < 2:
-                    await asyncio.sleep(2 ** attempt)
-    return None
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        try:
+            url = f"{TMDB_BASE_URL}{endpoint}"
+            logger.info(f"TMDB Request: {url} | Params: {params}")
+            
+            resp = await client.get(url, params=params, headers=headers)
+            logger.info(f"TMDB Response Status: {resp.status_code}")
+            
+            resp.raise_for_status()
+            data = resp.json()
+            
+            _cache[cache_key] = (now, data)
+            return data
+        except httpx.HTTPStatusError as e:
+            logger.error(f"TMDB HTTP Error {e.response.status_code}: {e.response.text}")
+            return None
+        except Exception as e:
+            logger.error(f"TMDB Request Exception: {e}")
+            return None
 
 async def search_myshows(query: str) -> list:
-    """Резервный поиск через MyShows.me, если TMDB не нашел русское название"""
+    """Резервный поиск через MyShows.me"""
     try:
         url = f"https://myshows.me/search/?q={urllib.parse.quote(query)}"
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(url, headers=headers)
+            if resp.status_code == 403:
+                logger.warning("MyShows заблокировал запрос (Cloudflare 403). Это нормально для хостингов.")
+                return []
             resp.raise_for_status()
         
         soup = BeautifulSoup(resp.text, 'html.parser')
@@ -160,32 +167,45 @@ async def search_myshows(query: str) -> list:
             if a and a.get('href'):
                 title = a.get_text(strip=True)
                 href = a['href']
-                # Извлекаем ID из ссылки вида /shows/12345/show-name/
                 parts = href.strip('/').split('/')
                 if len(parts) >= 2 and parts[0] == 'shows':
                     show_id = parts[1]
                     results.append({'id': f"ms_{show_id}", 'name': title, 'source': 'myshows', 'href': href})
                     if len(results) >= 5:
                         break
+        logger.info(f"MyShows found {len(results)} results for '{query}'")
         return results
     except Exception as e:
-        logging.error(f"MyShows search error: {e}")
+        logger.error(f"MyShows search error: {e}")
         return []
 
 async def hybrid_search(query: str) -> list:
-    """Сначала ищет в TMDB (RU), затем в TMDB (EN), затем в MyShows"""
+    logger.info(f"--- НАЧАЛО ПОИСКА ДЛЯ: '{query}' ---")
+    
     # 1. TMDB на русском
-    data_ru = await tmdb_request("/search/tv", {"query": query, "include_adult": "false"})
-    if data_ru and data_ru.get("results"):
+    data_ru = await tmdb_request("/search/tv", {"query": query, "language": "ru-RU", "include_adult": "false"})
+    if data_ru and data_ru.get("results") and len(data_ru["results"]) > 0:
+        logger.info(f"Успешно найдено в TMDB (RU): {len(data_ru['results'])} результатов")
         return data_ru["results"]
+    else:
+        logger.info("TMDB (RU) не дал результатов или вернул ошибку.")
     
-    # 2. TMDB на английском (если пользователь ввел транслит или англ. название)
+    # 2. TMDB на английском
     data_en = await tmdb_request("/search/tv", {"query": query, "language": "en-US", "include_adult": "false"})
-    if data_en and data_en.get("results"):
+    if data_en and data_en.get("results") and len(data_en["results"]) > 0:
+        logger.info(f"Успешно найдено в TMDB (EN): {len(data_en['results'])} результатов")
         return data_en["results"]
+    else:
+        logger.info("TMDB (EN) не дал результатов или вернул ошибку.")
     
-    # 3. Резервный парсинг MyShows
-    return await search_myshows(query)
+    # 3. MyShows
+    logger.info("Попытка поиска в MyShows...")
+    ms_results = await search_myshows(query)
+    if ms_results:
+        return ms_results
+        
+    logger.info("--- ПОИСК ЗАВЕРШЕН: НИЧЕГО НЕ НАЙДЕНО ---")
+    return []
 
 def get_title_with_fallback(item: dict) -> str:
     if 'name' in item:
@@ -270,17 +290,39 @@ def subs_kb(shows):
     return kb
 
 # ==========================================
-# --- ОБРАБОТЧИКИ (ЖЕЛЕЗОБЕТОННОЕ РЕДАКТИРОВАНИЕ) ---
+# --- ОБРАБОТЧИКИ ---
 # ==========================================
 @router.message(CommandStart())
 async def cmd_start(message: Message):
     await register_user(message.from_user.id)
     await message.answer(
         "👋 Привет! Я отслеживаю выход новых серий.\n"
-        "💡 Поиск работает через TMDB и MyShows (русский и английский).\n"
+        "💡 Поиск работает через TMDB и MyShows.\n"
         "Все действия обновляют это сообщение, не засоряя чат.",
         reply_markup=await main_kb()
     )
+
+@router.message(Command("test_search"))
+async def cmd_test_search(message: Message):
+    """Админ-команда для быстрой проверки поиска без меню"""
+    if str(message.from_user.id) != str(ADMIN_ID):
+        return
+    
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Использование: `/test_search <название сериала>`", parse_mode="Markdown")
+        return
+    
+    query = parts[1].strip()
+    loading_msg = await message.answer(f"🔍 Тестирую поиск для: '{query}'...")
+    
+    results = await hybrid_search(query)
+    
+    if not results:
+        await loading_msg.edit_text(f"❌ Тест поиска завершен: ничего не найдено для '{query}'.\nПроверьте логи в консоли для деталей.")
+    else:
+        titles = [get_title_with_fallback(r) for r in results]
+        await loading_msg.edit_text(f"✅ Тест поиска успешен! Найдено {len(results)} результатов:\n\n" + "\n".join(f"• {t}" for t in titles))
 
 @router.callback_query(F.data == "main_menu")
 async def go_main(callback: CallbackQuery):
@@ -308,10 +350,8 @@ async def search_show(message: Message, state: FSMContext):
     await state.clear()
     query = message.text.strip()
     
-    # 1. СОЗДАЕМ сообщение, которое будем редактировать. Это наш "якорь".
     loading_msg = await message.answer("🔎 Ищу в TMDB и MyShows...")
     
-    # 2. Пытаемся удалить сообщение пользователя (если бот админ, иначе игнорируем ошибку)
     try:
         await message.delete()
     except Exception:
@@ -321,10 +361,8 @@ async def search_show(message: Message, state: FSMContext):
         await loading_msg.edit_text("❌ Введите название сериала.", reply_markup=await main_kb())
         return
     
-    # 3. Делаем запрос
     results = await hybrid_search(query)
     
-    # 4. РЕДАКТИРУЕМ loading_msg. Никаких новых message.answer!
     if not results:
         await loading_msg.edit_text(
             f"❌ По запросу '{query}' ничего не найдено.\n\n"
@@ -344,7 +382,6 @@ async def select_show(callback: CallbackQuery):
     item_id = callback.data.split("_", 1)[1]
     await callback.answer("⏳ Загружаю данные...")
     
-    # Если это MyShows, мы не можем получить детали без API, просим выбрать из TMDB
     if item_id.startswith("ms_"):
         await callback.message.edit_text(
             "⚠️ Для надежного отслеживания дат выхода серий выберите сериал из результатов TMDB (🎬).\n"
@@ -392,15 +429,9 @@ async def cmd_del(callback: CallbackQuery):
     await remove_sub(callback.from_user.id, tmdb_id)
     shows = await get_subs(callback.from_user.id)
     if not shows:
-        await callback.message.edit_text(
-            "📭 Пока нет отслеживаемых сериалов.",
-            reply_markup=await main_kb()
-        )
+        await callback.message.edit_text("📭 Пока нет отслеживаемых сериалов.", reply_markup=await main_kb())
     else:
-        await callback.message.edit_text(
-            f"📺 Ваши подписки ({len(shows)}):",
-            reply_markup=subs_kb(shows)
-        )
+        await callback.message.edit_text(f"📺 Ваши подписки ({len(shows)}):", reply_markup=subs_kb(shows))
     await callback.answer("🗑 Удалено")
 
 @router.callback_query(F.data == "force_check")
@@ -535,10 +566,7 @@ async def process_custom_amount(message: Message, state: FSMContext):
     await state.clear()
     user_input = message.text.strip()
     
-    # 1. Создаем якорное сообщение
     response_msg = await message.answer("Обработка...")
-    
-    # 2. Удаляем сообщение пользователя
     try:
         await message.delete()
     except Exception:
@@ -554,8 +582,8 @@ async def process_custom_amount(message: Message, state: FSMContext):
         await response_msg.edit_text("❌ Минимальная сумма доната: 10 звезд ⭐️", reply_markup=await main_kb())
         return
 
-    await response_msg.edit_text("Формирую счет...", reply_markup=await main_kb()) # Промежуточное редактирование
-    await response_msg.answer_invoice( # answer_invoice всегда создает новое сообщение, это особенность Telegram API, но оно одно
+    await response_msg.edit_text("Формирую счет...", reply_markup=await main_kb())
+    await response_msg.answer_invoice(
         title=f"💎 Поддержка бота ({amount} ⭐️)",
         description=f"Вы указали сумму: {amount} Stars.",
         payload=f"donate_custom_{amount}_stars",
@@ -584,7 +612,7 @@ async def on_successful_payment(message: Message):
 # --- ФОНОВАЯ ПРОВЕРКА ---
 # ==========================================
 async def check_new_episodes(force: bool = False):
-    logging.info("Запуск проверки новых серий...")
+    logger.info("Запуск проверки новых серий...")
     now = time.time()
     async with db.execute("SELECT user_id, tmdb_id, title, last_season, last_episode, last_checked FROM subscriptions") as cur:
         subs = await cur.fetchall()
@@ -616,9 +644,9 @@ async def check_new_episodes(force: bool = False):
                     f"📺 **{title}**\n"
                     f"🔹 Сезон {current_seasons}, Серия {current_episodes}"
                 )
-                logging.info(f"Новая серия {title} для {user_id}")
+                logger.info(f"Новая серия {title} для {user_id}")
             except Exception as e:
-                logging.error(f"Ошибка отправки {user_id}: {e}")
+                logger.error(f"Ошибка отправки {user_id}: {e}")
 
         await update_sub(user_id, tmdb_id, current_seasons, current_episodes, now)
 
@@ -628,7 +656,7 @@ async def check_new_episodes(force: bool = False):
 async def main():
     await init_db()
     asyncio.create_task(check_new_episodes())
-    logging.info(f"🤖 Бот запущен! Admin ID: {ADMIN_ID}")
+    logger.info(f"🤖 Бот запущен! Admin ID: {ADMIN_ID}")
     try:
         await dp.start_polling(bot)
     finally:
