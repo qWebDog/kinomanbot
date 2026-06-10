@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import time
+import urllib.parse
 from typing import Dict, Tuple, Optional, Callable, Any, Awaitable
 
 from aiogram import Bot, Dispatcher, Router, F, BaseMiddleware
@@ -15,6 +16,7 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 import httpx
 import aiosqlite
+from bs4 import BeautifulSoup
 
 # ==========================================
 # --- КОНФИГУРАЦИЯ ---
@@ -23,7 +25,7 @@ BOT_TOKEN = "8764495369:AAGuaieVwmsHzVloDRZDgv2nP6oDijAYTC4"
 TMDB_API_KEY = "eyJhbGciOiJIUzI1NiJ9.eyJhdWQiOiI5NTEwYjJlODAxYmFlMTcxNzFmNzM2NWU4ZGIyOTJiMSIsIm5iZiI6MTc4MTA4NzkzOS40NTIsInN1YiI6IjZhMjkzZWMzYTAwOTBhNDQ4Y2Q0ZTUwZCIsInNjb3BlcyI6WyJhcGlfcmVhZCJdLCJ2ZXJzaW9uIjoxfQ.myFjB6izWez3gXOA-8ErMPX2AH6SGKjPMFbUT7RcZrY"
 TMDB_BASE_URL = "https://api.themoviedb.org/3"
 
-# ⚠️ ЗАМЕНИТЕ ЭТОТ ID НА ВАШ РЕАЛЬНЫЙ TELEGRAM ID
+# ⚠️ ЗАМЕНИТЕ НА ВАШ РЕАЛЬНЫЙ ID
 ADMIN_ID = 123456789  
 
 CHECK_INTERVAL = 7200
@@ -103,7 +105,7 @@ async def update_sub(user_id: int, tmdb_id: int, season: int, episode: int, chec
     await db.commit()
 
 # ==========================================
-# --- API И КЭШ ---
+# --- API И ГИБРИДНЫЙ ПОИСК (TMDB + MyShows) ---
 # ==========================================
 _cache: Dict[str, Tuple[float, dict]] = {}
 
@@ -142,10 +144,53 @@ async def tmdb_request(endpoint: str, params: dict = None) -> Optional[dict]:
                     await asyncio.sleep(2 ** attempt)
     return None
 
+async def search_myshows(query: str) -> list:
+    """Резервный поиск через MyShows.me, если TMDB не нашел русское название"""
+    try:
+        url = f"https://myshows.me/search/?q={urllib.parse.quote(query)}"
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(url, headers=headers)
+            resp.raise_for_status()
+        
+        soup = BeautifulSoup(resp.text, 'html.parser')
+        results = []
+        for div in soup.find_all('div', class_='show-title'):
+            a = div.find('a')
+            if a and a.get('href'):
+                title = a.get_text(strip=True)
+                href = a['href']
+                # Извлекаем ID из ссылки вида /shows/12345/show-name/
+                parts = href.strip('/').split('/')
+                if len(parts) >= 2 and parts[0] == 'shows':
+                    show_id = parts[1]
+                    results.append({'id': f"ms_{show_id}", 'name': title, 'source': 'myshows', 'href': href})
+                    if len(results) >= 5:
+                        break
+        return results
+    except Exception as e:
+        logging.error(f"MyShows search error: {e}")
+        return []
+
+async def hybrid_search(query: str) -> list:
+    """Сначала ищет в TMDB (RU), затем в TMDB (EN), затем в MyShows"""
+    # 1. TMDB на русском
+    data_ru = await tmdb_request("/search/tv", {"query": query, "include_adult": "false"})
+    if data_ru and data_ru.get("results"):
+        return data_ru["results"]
+    
+    # 2. TMDB на английском (если пользователь ввел транслит или англ. название)
+    data_en = await tmdb_request("/search/tv", {"query": query, "language": "en-US", "include_adult": "false"})
+    if data_en and data_en.get("results"):
+        return data_en["results"]
+    
+    # 3. Резервный парсинг MyShows
+    return await search_myshows(query)
+
 def get_title_with_fallback(item: dict) -> str:
-    """Гарантированно возвращает название: русское, если есть, иначе оригинальное"""
-    title = item.get('name') or item.get('original_name') or item.get('title') or item.get('original_title') or 'Неизвестно'
-    return title.strip()
+    if 'name' in item:
+        return item.get('name') or item.get('original_name') or 'Неизвестно'
+    return item.get('title') or item.get('original_title') or 'Неизвестно'
 
 # ==========================================
 # --- AIОGRAM SETUP & MIDDLEWARE ---
@@ -206,9 +251,10 @@ def search_kb(results):
     kb = InlineKeyboardMarkup(inline_keyboard=[])
     for r in results[:5]:
         title = get_title_with_fallback(r)
-        year = r.get('first_air_date', '')[:4] if r.get('first_air_date') else 'N/A'
+        year = r.get('first_air_date', '')[:4] if r.get('first_air_date') else (r.get('href', '').split('/')[-1] if 'href' in r else 'N/A')
+        source_icon = "🇷🇺" if r.get('source') == 'myshows' else "🎬"
         kb.inline_keyboard.append([InlineKeyboardButton(
-            text=f"🎬 {title} ({year})",
+            text=f"{source_icon} {title} ({year})",
             callback_data=f"select_{r['id']}"
         )])
     kb.inline_keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")])
@@ -224,14 +270,14 @@ def subs_kb(shows):
     return kb
 
 # ==========================================
-# --- ОБРАБОТЧИКИ (С ОЧИСТКОЙ МУСОРА) ---
+# --- ОБРАБОТЧИКИ (ЖЕЛЕЗОБЕТОННОЕ РЕДАКТИРОВАНИЕ) ---
 # ==========================================
 @router.message(CommandStart())
 async def cmd_start(message: Message):
     await register_user(message.from_user.id)
     await message.answer(
         "👋 Привет! Я отслеживаю выход новых серий.\n"
-        "💡 Поиск работает на русском и английском.\n"
+        "💡 Поиск работает через TMDB и MyShows (русский и английский).\n"
         "Все действия обновляют это сообщение, не засоряя чат.",
         reply_markup=await main_kb()
     )
@@ -262,42 +308,52 @@ async def search_show(message: Message, state: FSMContext):
     await state.clear()
     query = message.text.strip()
     
-    # 🧹 ОЧИСТКА ЧАТА: Удаляем сообщение пользователя, чтобы не было мусора
+    # 1. СОЗДАЕМ сообщение, которое будем редактировать. Это наш "якорь".
+    loading_msg = await message.answer("🔎 Ищу в TMDB и MyShows...")
+    
+    # 2. Пытаемся удалить сообщение пользователя (если бот админ, иначе игнорируем ошибку)
     try:
         await message.delete()
     except Exception:
-        pass # Если бот не админ, сообщение останется, но спама от бота не будет
+        pass 
 
     if not query:
-        await message.answer("❌ Введите название сериала.", reply_markup=await main_kb())
+        await loading_msg.edit_text("❌ Введите название сериала.", reply_markup=await main_kb())
         return
     
-    # Отправляем временное сообщение, которое будем редактировать
-    temp_msg = await message.answer("🔎 Ищу в базе...")
+    # 3. Делаем запрос
+    results = await hybrid_search(query)
     
-    data = await tmdb_request("/search/tv", {"query": query, "include_adult": "false"})
-    
-    if not data or not data.get("results"):
-        await temp_msg.edit_text(
-            f"❌ Сериалы по запросу '{query}' не найдены.\n\n"
+    # 4. РЕДАКТИРУЕМ loading_msg. Никаких новых message.answer!
+    if not results:
+        await loading_msg.edit_text(
+            f"❌ По запросу '{query}' ничего не найдено.\n\n"
             "💡 Попробуйте ввести оригинальное название на английском языке.",
             reply_markup=await main_kb()
         )
-        return
-    
-    results = data["results"]
-    await temp_msg.edit_text(
-        f"📺 Найдено совпадений: {len(results)}\n"
-        f"🔍 По запросу: '{query}'\n\n"
-        "Выберите сериал из списка:",
-        reply_markup=search_kb(results)
-    )
+    else:
+        await loading_msg.edit_text(
+            f"📺 Найдено совпадений: {len(results)}\n"
+            f"🔍 По запросу: '{query}'\n\n"
+            "Выберите сериал:",
+            reply_markup=search_kb(results)
+        )
 
 @router.callback_query(F.data.startswith("select_"))
 async def select_show(callback: CallbackQuery):
-    tmdb_id = int(callback.data.split("_")[1])
+    item_id = callback.data.split("_", 1)[1]
     await callback.answer("⏳ Загружаю данные...")
     
+    # Если это MyShows, мы не можем получить детали без API, просим выбрать из TMDB
+    if item_id.startswith("ms_"):
+        await callback.message.edit_text(
+            "⚠️ Для надежного отслеживания дат выхода серий выберите сериал из результатов TMDB (🎬).\n"
+            "MyShows используется только как резервный поиск названий.",
+            reply_markup=await main_kb()
+        )
+        return
+
+    tmdb_id = int(item_id)
     info = await tmdb_request(f"/tv/{tmdb_id}")
     if not info:
         await callback.message.edit_text("⚠️ Не удалось загрузить данные.", reply_markup=await main_kb())
@@ -332,7 +388,7 @@ async def cmd_my(callback: CallbackQuery):
 
 @router.callback_query(F.data.startswith("del_"))
 async def cmd_del(callback: CallbackQuery):
-    tmdb_id = int(callback.data.split("_")[1])
+    tmdb_id = int(callback.data.split("_", 1)[1])
     await remove_sub(callback.from_user.id, tmdb_id)
     shows = await get_subs(callback.from_user.id)
     if not shows:
@@ -479,7 +535,10 @@ async def process_custom_amount(message: Message, state: FSMContext):
     await state.clear()
     user_input = message.text.strip()
     
-    # 🧹 ОЧИСТКА ЧАТА: Удаляем сообщение пользователя с суммой
+    # 1. Создаем якорное сообщение
+    response_msg = await message.answer("Обработка...")
+    
+    # 2. Удаляем сообщение пользователя
     try:
         await message.delete()
     except Exception:
@@ -488,14 +547,15 @@ async def process_custom_amount(message: Message, state: FSMContext):
     try:
         amount = int(user_input)
     except ValueError:
-        await message.answer("❌ Пожалуйста, введите целое число.", reply_markup=await main_kb())
+        await response_msg.edit_text("❌ Пожалуйста, введите целое число.", reply_markup=await main_kb())
         return
 
     if amount < 10:
-        await message.answer("❌ Минимальная сумма доната: 10 звезд ⭐️", reply_markup=await main_kb())
+        await response_msg.edit_text("❌ Минимальная сумма доната: 10 звезд ⭐️", reply_markup=await main_kb())
         return
 
-    await message.answer_invoice(
+    await response_msg.edit_text("Формирую счет...", reply_markup=await main_kb()) # Промежуточное редактирование
+    await response_msg.answer_invoice( # answer_invoice всегда создает новое сообщение, это особенность Telegram API, но оно одно
         title=f"💎 Поддержка бота ({amount} ⭐️)",
         description=f"Вы указали сумму: {amount} Stars.",
         payload=f"donate_custom_{amount}_stars",
