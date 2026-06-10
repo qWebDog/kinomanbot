@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import time
-import urllib.parse
 from typing import Dict, Tuple, Optional, Callable, Any, Awaitable
 
 from aiogram import Bot, Dispatcher, Router, F, BaseMiddleware
@@ -16,18 +15,18 @@ from aiogram.fsm.storage.memory import MemoryStorage
 
 import httpx
 import aiosqlite
-from bs4 import BeautifulSoup
 
 # ==========================================
 # --- КОНФИГУРАЦИЯ ---
 # ==========================================
 BOT_TOKEN = "8764495369:AAGuaieVwmsHzVloDRZDgv2nP6oDijAYTC4"
 TMDB_API_KEY = "eyJhbGciOiJIUzI1NiJ9.eyJhdWQiOiI5NTEwYjJlODAxYmFlMTcxNzFmNzM2NWU4ZGIyOTJiMSIsIm5iZiI6MTc4MTA4NzkzOS40NTIsInN1YiI6IjZhMjkzZWMzYTAwOTBhNDQ4Y2Q0ZTUwZCIsInNjb3BlcyI6WyJhcGlfcmVhZCJdLCJ2ZXJzaW9uIjoxfQ.myFjB6izWez3gXOA-8ErMPX2AH6SGKjPMFbUT7RcZrY"
-OMDB_API_KEY = "a3c0826c"  
+OMDB_API_KEY = "a3c0826c"
+
 TMDB_BASE_URL = "https://api.themoviedb.org/3"
 OMDB_BASE_URL = "https://www.omdbapi.com"
 
-ADMIN_ID = 673594120 
+ADMIN_ID = 673594120
 
 CHECK_INTERVAL = 7200
 CACHE_TTL = 3600
@@ -105,7 +104,7 @@ async def update_sub(user_id: int, tmdb_id: int, season: int, episode: int, chec
     await db.commit()
 
 # ==========================================
-# --- API: TMDB + OMDb + MyShows ---
+# --- API: TMDB + OMDb ---
 # ==========================================
 _cache: Dict[str, Tuple[float, dict]] = {}
 
@@ -140,8 +139,8 @@ async def tmdb_request(endpoint: str, params: dict = None) -> Optional[dict]:
             return None
 
 async def omdb_search(query: str) -> list:
-    """Поиск через OMDb API (работает даже когда TMDB заблокирован)"""
-    if not OMDB_API_KEY or OMDB_API_KEY == "ВАШ_OMDB_API_КЛЮЧ":
+    """Поиск через OMDb API"""
+    if not OMDB_API_KEY:
         logger.warning("OMDb API ключ не настроен")
         return []
     
@@ -165,6 +164,13 @@ async def omdb_search(query: str) -> list:
             resp.raise_for_status()
             data = resp.json()
             
+            if data.get("Response") == "False":
+                error_msg = data.get("Error", "Unknown error")
+                logger.info(f"OMDb Error: {error_msg}")
+                if "Too many results" in error_msg:
+                    return [{"error": "too_many_results", "query": query}]
+                return []
+            
             if data.get("Response") == "True" and data.get("Search"):
                 results = []
                 for item in data["Search"]:
@@ -179,7 +185,7 @@ async def omdb_search(query: str) -> list:
                 logger.info(f"OMDb found {len(results)} results")
                 return results
             else:
-                logger.info(f"OMDb: {data.get('Error', 'No results')}")
+                logger.info(f"OMDb: No results")
                 return []
     except Exception as e:
         logger.error(f"OMDb Error: {e}")
@@ -187,7 +193,7 @@ async def omdb_search(query: str) -> list:
 
 async def omdb_get_details(imdb_id: str) -> Optional[dict]:
     """Получение деталей сериала по IMDb ID через OMDb"""
-    if not OMDB_API_KEY or OMDB_API_KEY == "ВАШ_OMDB_API_КЛЮЧ":
+    if not OMDB_API_KEY:
         return None
     
     cache_key = f"omdb_detail_{imdb_id}"
@@ -215,52 +221,6 @@ async def omdb_get_details(imdb_id: str) -> Optional[dict]:
         logger.error(f"OMDb Detail Error: {e}")
         return None
 
-async def search_myshows(query: str) -> list:
-    """Резервный поиск через MyShows.me"""
-    try:
-        url = f"https://myshows.me/search/?q={urllib.parse.quote(query)}"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8"
-        }
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(url, headers=headers, follow_redirects=True)
-            if resp.status_code == 403:
-                logger.warning("MyShows: Cloudflare 403")
-                return []
-            resp.raise_for_status()
-        
-        soup = BeautifulSoup(resp.text, 'html.parser')
-        results = []
-        
-        # Пробуем разные селекторы (MyShows может менять структуру)
-        for selector in ['div.show-title a', 'h2 a', '.search-results a', 'a[href*="/shows/"]']:
-            for a in soup.select(selector):
-                if a.get('href') and '/shows/' in a.get('href', ''):
-                    title = a.get_text(strip=True)
-                    href = a['href']
-                    if title and len(title) > 2:
-                        parts = href.strip('/').split('/')
-                        if len(parts) >= 2:
-                            show_id = parts[1] if parts[0] == 'shows' else parts[0]
-                            results.append({
-                                'id': f"ms_{show_id}",
-                                'name': title,
-                                'source': 'myshows',
-                                'href': href
-                            })
-                            if len(results) >= 5:
-                                break
-            if results:
-                break
-        
-        logger.info(f"MyShows found {len(results)} results")
-        return results
-    except Exception as e:
-        logger.error(f"MyShows Error: {e}")
-        return []
-
 async def hybrid_search(query: str) -> list:
     logger.info(f"--- ПОИСК: '{query}' ---")
     
@@ -276,17 +236,11 @@ async def hybrid_search(query: str) -> list:
         logger.info(f"TMDB (EN): {len(data_en['results'])} результатов")
         return data_en["results"]
     
-    # 3. OMDb (запасной вариант, работает всегда)
+    # 3. OMDb (запасной вариант)
     logger.info("TMDB недоступен, пробуем OMDb...")
     omdb_results = await omdb_search(query)
     if omdb_results:
         return omdb_results
-    
-    # 4. MyShows (последний резерв)
-    logger.info("OMDb не дал результатов, пробуем MyShows...")
-    ms_results = await search_myshows(query)
-    if ms_results:
-        return ms_results
     
     logger.info("--- НИЧЕГО НЕ НАЙДЕНО ---")
     return []
@@ -356,7 +310,7 @@ def search_kb(results):
     for r in results[:5]:
         title = get_title_with_fallback(r)
         year = r.get('first_air_date', '')[:4] if r.get('first_air_date') else r.get('year', 'N/A')
-        source_icon = "🇷🇺" if r.get('source') == 'myshows' else ("🎬" if r.get('source') == 'omdb' else "🎥")
+        source_icon = "🎬" if r.get('source') == 'omdb' else "🎥"
         kb.inline_keyboard.append([InlineKeyboardButton(
             text=f"{source_icon} {title} ({year})",
             callback_data=f"select_{r['id']}"
@@ -381,7 +335,7 @@ async def cmd_start(message: Message):
     await register_user(message.from_user.id)
     await message.answer(
         "👋 Привет! Я отслеживаю выход новых серий.\n"
-        "💡 Поиск: TMDB → OMDb → MyShows (работает всегда!)\n"
+        "💡 Поиск: TMDB → OMDb\n"
         "Все действия обновляют одно сообщение.",
         reply_markup=await main_kb()
     )
@@ -397,6 +351,16 @@ async def cmd_test_search(message: Message):
     query = parts[1].strip()
     loading_msg = await message.answer(f"🔍 Тестирую: '{query}'...")
     results = await hybrid_search(query)
+    
+    if results and len(results) == 1 and results[0].get("error") == "too_many_results":
+        await loading_msg.edit_text(
+            f"⚠️ OMDb вернул 'Too many results' для '{query}'.\n\n"
+            "Попробуйте уточнить запрос:\n"
+            "• Добавить год\n"
+            "• Использовать английское название"
+        )
+        return
+    
     if not results:
         await loading_msg.edit_text(f"❌ Ничего не найдено для '{query}'.\nПроверьте логи.")
     else:
@@ -440,6 +404,16 @@ async def search_show(message: Message, state: FSMContext):
     
     results = await hybrid_search(query)
     
+    if results and len(results) == 1 and results[0].get("error") == "too_many_results":
+        await loading_msg.edit_text(
+            f"⚠️ По запросу '{query}' найдено слишком много результатов.\n\n"
+            "💡 Попробуйте:\n"
+            "• Добавить год (например: 'Breaking Bad 2008')\n"
+            "• Использовать оригинальное название на английском",
+            reply_markup=await main_kb()
+        )
+        return
+    
     if not results:
         await loading_msg.edit_text(
             f"❌ По запросу '{query}' ничего не найдено.\n\n"
@@ -470,14 +444,6 @@ async def select_show(callback: CallbackQuery):
             )
         else:
             await callback.message.edit_text("⚠️ Не удалось загрузить данные.", reply_markup=await main_kb())
-        return
-    
-    # MyShows результат
-    if item_id.startswith("ms_"):
-        await callback.message.edit_text(
-            "⚠️ Для отслеживания выберите сериал из TMDB (🎥) или OMDb (🎬).",
-            reply_markup=await main_kb()
-        )
         return
 
     # TMDB результат
